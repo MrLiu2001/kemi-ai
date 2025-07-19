@@ -226,8 +226,10 @@ async function deleteGeminiKey(keyId) {
     }
     const trimmedKeyId = keyId.trim();
 
-    // Use transaction to wrap the entire deletion process to ensure atomicity
-    await configService.runDb('BEGIN TRANSACTION');
+    // Use serializeDb to ensure atomic operations and avoid concurrency issues
+    await configService.serializeDb(async () => {
+        // Use transaction to wrap the entire deletion process to ensure atomicity
+        await configService.runDb('BEGIN TRANSACTION');
     
     try {
         // Check if key exists before deleting
@@ -289,7 +291,7 @@ async function deleteGeminiKey(keyId) {
         // All operations completed successfully, commit the transaction
         await configService.runDb('COMMIT');
         console.log(`Deleted Gemini key ${trimmedKeyId} from database.`);
-        
+
         // GitHub sync outside the transaction (doesn't affect atomicity)
         await dbModule.syncToGitHub();
     } catch (error) {
@@ -298,6 +300,7 @@ async function deleteGeminiKey(keyId) {
         console.error(`Error deleting Gemini key ${trimmedKeyId}:`, error);
         throw error; // Re-throw the error for upstream handling
     }
+    });
 }
 
 /**
@@ -523,6 +526,55 @@ async function deleteAllErrorKeys() {
 }
 
 /**
+ * Clears error status for all keys that have error status (400, 401, or 403).
+ * @returns {Promise<{clearedCount: number, clearedKeys: Array<{id: string, name: string}>}>}
+ */
+async function clearAllErrorKeys() {
+    return await configService.serializeDb(async () => {
+        await configService.runDb('BEGIN TRANSACTION');
+
+        try {
+            // First, get all error keys to return information about what was cleared
+            const errorKeys = await configService.allDb('SELECT id, name, error_status FROM gemini_keys WHERE error_status = 400 OR error_status = 401 OR error_status = 403');
+
+            if (errorKeys.length === 0) {
+                await configService.runDb('COMMIT');
+                return { clearedCount: 0, clearedKeys: [] };
+            }
+
+            // Get the error key IDs
+            const errorKeyIds = errorKeys.map(key => key.id);
+
+            // Clear error status for all error keys
+            const placeholders = errorKeyIds.map(() => '?').join(',');
+            const updateResult = await configService.runDb(
+                `UPDATE gemini_keys SET error_status = NULL WHERE id IN (${placeholders})`,
+                errorKeyIds
+            );
+
+            await configService.runDb('COMMIT');
+            console.log(`Cleared error status for ${updateResult.changes} keys.`);
+
+            // Sync updates to GitHub - outside transaction
+            await dbModule.syncToGitHub();
+
+            return {
+                clearedCount: updateResult.changes,
+                clearedKeys: errorKeys.map(key => ({
+                    id: key.id,
+                    name: key.name || key.id,
+                    previousErrorStatus: key.error_status
+                }))
+            };
+        } catch (error) {
+            await configService.runDb('ROLLBACK');
+            console.error('Error clearing all error keys:', error);
+            throw error;
+        }
+    });
+}
+
+/**
  * Records a persistent error (400/401/403) for a key.
  * @param {string} keyId
  * @param {400 | 401 | 403} status
@@ -585,13 +637,15 @@ async function getNextAvailableGeminiKey(requestedModelId, updateIndex = true) {
 
         // Use transaction for index updates to prevent race conditions
         let selectedKeyData = null;
-        
-        // Start transaction if we're going to update the index
-        if (updateIndex) {
-            await configService.runDb('BEGIN TRANSACTION');
-        }
-        
-        try {
+
+        // Wrap transaction operations in serializeDb to prevent conflicts with other operations
+        const executeKeySelection = async () => {
+            // Start transaction if we're going to update the index
+            if (updateIndex) {
+                await configService.runDb('BEGIN TRANSACTION');
+            }
+
+            try {
             // Get the most current index value within the transaction if updating
             let currentIndex;
             if (updateIndex) {
@@ -743,13 +797,24 @@ async function getNextAvailableGeminiKey(requestedModelId, updateIndex = true) {
             
             return selectedKeyData;
             
-        } catch (error) {
-            // If any error occurs and we're in a transaction, rollback
-            if (updateIndex) {
-                await configService.runDb('ROLLBACK');
+            } catch (error) {
+                // If any error occurs and we're in a transaction, rollback
+                if (updateIndex) {
+                    await configService.runDb('ROLLBACK');
+                }
+                throw error; // Re-throw to be caught by outer try/catch
             }
-            throw error; // Re-throw to be caught by outer try/catch
+        };
+
+        // Execute key selection with or without serialization based on updateIndex
+        if (updateIndex) {
+            selectedKeyData = await configService.serializeDb(executeKeySelection);
+        } else {
+            selectedKeyData = await executeKeySelection();
         }
+
+        return selectedKeyData;
+
     } catch (error) {
         console.error("Error retrieving or processing Gemini keys:", error);
         return null;
@@ -840,8 +905,10 @@ async function incrementKeyUsage(keyId, modelId, category) {
  * @returns {Promise<void>}
  */
 async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
-    // Start a transaction for atomic update
-    await configService.runDb('BEGIN TRANSACTION');
+    // Use serializeDb to ensure atomic operations and avoid concurrency issues
+    await configService.serializeDb(async () => {
+        // Start a transaction for atomic update
+        await configService.runDb('BEGIN TRANSACTION');
     
     try {
         // Fetch current key info and configs
@@ -956,7 +1023,7 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
         await configService.runDb('COMMIT');
         
         console.log(`Key ${keyId} quota forced for category ${category}${modelId ? ` (model: ${modelId})` : ''} for date ${usageDate}.`);
-        
+
         // Sync updates to GitHub outside transaction
         await dbModule.syncToGitHub();
     } catch (e) {
@@ -964,6 +1031,7 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
         await configService.runDb('ROLLBACK');
         console.error(`Failed to force quota limit for key ${keyId}:`, e);
     }
+    });
 }
 
 /**
@@ -990,10 +1058,12 @@ async function handle429Error(keyId, category, modelId, errorDetails) {
     // --- Handle Quota Exceeded 429 ---
     console.warn(`Received quota-exceeded 429 for key ${keyId}. Proceeding with counter logic.`);
 
-    let transactionCommitted = false; // Flag to prevent double commit/rollback in finally block if forceSetQuotaToLimit is called
-    try {
-        // Start transaction only if we are processing a quota-exceeded error
-        await configService.runDb('BEGIN TRANSACTION');
+    // Use serializeDb to ensure atomic operations and avoid concurrency issues
+    await configService.serializeDb(async () => {
+        let transactionCommitted = false; // Flag to prevent double commit/rollback in finally block if forceSetQuotaToLimit is called
+        try {
+            // Start transaction only if we are processing a quota-exceeded error
+            await configService.runDb('BEGIN TRANSACTION');
 
         // Get models and quotas (can stay outside transaction)
         const [modelsConfig, categoryQuotas] = await Promise.all([
@@ -1085,6 +1155,7 @@ async function handle429Error(keyId, category, modelId, errorDetails) {
         }
         // Do not rethrow, allow processing to continue if possible
     }
+    });
 }
 
 
@@ -1100,4 +1171,5 @@ module.exports = {
     getErrorKeys,
     clearKeyError,
     deleteAllErrorKeys,
+    clearAllErrorKeys,
 };
